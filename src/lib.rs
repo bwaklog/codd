@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, usize};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Type {
     Str,
     Int,
@@ -9,19 +9,19 @@ pub enum Type {
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum Value {
     Str(String),
-    Int(i32),
+    Int(i64),
 }
 
 pub type Row = Vec<Value>;
 // have a row type as an iterable, inspired by toydb
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Attribute {
     name: String,
     atype: Type,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Schema {
     attributes: Vec<Attribute>,
 }
@@ -52,7 +52,7 @@ impl Schema {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(unused)]
 pub struct Relation {
     name: String,
@@ -109,6 +109,15 @@ impl Relation {
         }
 
         return true;
+    }
+
+    // this is being used in tests
+    #[allow(dead_code)]
+    fn get_tuples(&self) -> Vec<Row> {
+        Vec::from_iter(self.data.values())
+            .into_iter()
+            .map(|inner| inner.clone())
+            .collect::<Vec<Row>>()
     }
 }
 
@@ -175,7 +184,7 @@ impl ProjAttrs {
         ProjAttrIterator { current: self }
     }
 
-    pub fn execute(&self, relation: &Relation) -> Option<Vec<Row>> {
+    pub fn execute(&self, relation: &Relation) -> Option<Relation> {
         // println!("[Projection] query {:?}", self);
         match self {
             ProjAttrs::None => {
@@ -186,9 +195,16 @@ impl ProjAttrs {
                     .map(|inner| inner.clone())
                     .collect::<Vec<Row>>();
 
-                // println!("[Projection] result = {:?}", values);
+                let mut relation = Relation {
+                    name: "derived".to_string(),
+                    pk: relation.pk,
+                    schema: relation.schema.clone(),
+                    data: BTreeMap::new(),
+                };
 
-                return Some(values);
+                relation.insert_rows(values);
+
+                return Some(relation);
             }
             _ => {}
         }
@@ -207,26 +223,61 @@ impl ProjAttrs {
             &self
         );
 
-        let selected_attrs = self
+        let mut rel_attributes = self.iter().map(|f| f.clone()).collect::<Vec<_>>();
+
+        let selected_attrs_indices = self
             .iter()
             .map(|a| relation.schema.attributes.iter().position(|x| x == a))
             .map(|i| i.unwrap())
             .collect::<Vec<_>>();
 
+        let pk_missing = !selected_attrs_indices.contains(&relation.pk);
+        let mut pk_auto = 0;
+
+        // if pk_missing {
+        //     rel_attributes.insert(0, Attribute { name: "PKID".to_string(), atype: Type::Int});
+        // }
+
         let values = Vec::from_iter(relation.data.values())
             .into_iter()
             .map(|inner| {
-                inner
+                let mut tuple = inner
                     .clone()
                     .iter()
                     .enumerate()
-                    .filter(|(index, _)| selected_attrs.contains(index))
+                    .filter(|(index, _)| selected_attrs_indices.contains(index))
                     .map(|(_, v)| v.clone())
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                if pk_missing {
+                    tuple.insert(0, Value::Int(pk_auto));
+                    pk_auto += 1;
+                }
+                return tuple;
             })
             .collect::<Vec<Row>>();
 
-        return Some(values);
+        if pk_missing {
+            rel_attributes.insert(
+                0,
+                Attribute {
+                    name: "PKID".to_string(),
+                    atype: Type::Int,
+                },
+            );
+        }
+
+        let mut relation = Relation {
+            name: "derived".to_string(),
+            pk: relation.pk,
+            schema: Schema {
+                attributes: rel_attributes,
+            },
+            data: BTreeMap::new(),
+        };
+
+        relation.insert_rows(values);
+
+        return Some(relation);
     }
 }
 
@@ -263,7 +314,7 @@ pub enum UnaryOpr<'a> {
 }
 
 impl UnaryOpr<'_> {
-    pub fn evaluate(&self) -> Option<Vec<Row>> {
+    pub fn evaluate(&self) -> Option<Relation> {
         match self {
             UnaryOpr::Projection(p, r) => {
                 return p.execute(*r);
@@ -285,7 +336,7 @@ pub enum Operator<'a> {
 }
 
 impl Operator<'_> {
-    pub fn evaluate(&self) -> Option<Vec<Row>> {
+    pub fn evaluate(&self) -> Option<Relation> {
         match self {
             Operator::Unary(opr) => {
                 return opr.evaluate();
@@ -442,12 +493,12 @@ mod tests {
         assert_eq!(result.is_some(), true);
 
         assert_eq!(
-            result,
-            Some(vec![
+            result.as_ref().unwrap().get_tuples(),
+            vec![
                 vec![Value::Int(1), Value::Str("foo".to_string())],
                 vec![Value::Int(2), Value::Str("bar".to_string())],
                 vec![Value::Int(3), Value::Str("baz".to_string())],
-            ])
+            ]
         );
 
         println!("[TEST] query result: {:?}", result.unwrap());
@@ -466,13 +517,101 @@ mod tests {
         let result = select_value_attr.evaluate();
         assert_eq!(result.is_some(), true);
         assert_eq!(
-            result,
-            Some(vec![
-                vec![Value::Str("foo".to_string())],
-                vec![Value::Str("bar".to_string())],
-                vec![Value::Str("baz".to_string())]
-            ])
+            result.as_ref().unwrap().get_tuples(),
+            vec![
+                vec![Value::Int(0), Value::Str("foo".to_string())],
+                vec![Value::Int(1), Value::Str("bar".to_string())],
+                vec![Value::Int(2), Value::Str("baz".to_string())]
+            ]
         );
         println!("[TEST] selecting a single attribute {:?}", result);
+    }
+
+    #[test]
+    fn test_user_schema() {
+        // tbl users
+        // | id INT PK | name STR | phone INT
+        let mut relation = Relation {
+            name: "users".to_string(),
+            pk: 0,
+            schema: Schema {
+                attributes: vec![
+                    Attribute {
+                        name: "id".to_string(),
+                        atype: Type::Int,
+                    },
+                    Attribute {
+                        name: "name".to_string(),
+                        atype: Type::Str,
+                    },
+                    Attribute {
+                        name: "phone".to_string(),
+                        atype: Type::Int,
+                    },
+                ],
+            },
+            data: BTreeMap::new(),
+        };
+
+        // 100 | bob | 9999999999
+        // 101 | alice | 6666666666
+        let insert_result = relation.insert_rows(vec![
+            vec![
+                Value::Int(100),
+                Value::Str("bob".to_string()),
+                Value::Int(9999999999),
+            ],
+            vec![
+                Value::Int(101),
+                Value::Str("alice".to_string()),
+                Value::Int(6666666666),
+            ],
+        ]);
+        assert!(insert_result);
+        println!("{:?}", relation.data);
+
+        // pi_{name, phone}
+        let query = Operator::Unary(UnaryOpr::Projection(
+            ProjAttrs::Attr(
+                Attribute {
+                    name: "name".to_string(),
+                    atype: Type::Str,
+                },
+                Some(Box::new(ProjAttrs::Attr(
+                    Attribute {
+                        name: "phone".to_string(),
+                        atype: Type::Int,
+                    },
+                    None,
+                ))),
+            ),
+            &relation,
+        ));
+
+        let result = query.evaluate();
+
+        // tbl derived
+        // 0 | bob | 9999999999 <-
+        // 1 | alice | 6666666666
+        //^^^
+        // the new column here is a PK for
+        // the derived relation
+        assert_eq!(
+            result.as_ref().unwrap().get_tuples(),
+            vec![
+                vec![
+                    Value::Int(0),
+                    Value::Str("bob".to_string()),
+                    Value::Int(9999999999)
+                ],
+                vec![
+                    Value::Int(1),
+                    Value::Str("alice".to_string()),
+                    Value::Int(6666666666)
+                ],
+            ]
+        );
+
+        println!("{:?}", result.unwrap());
     }
 }
