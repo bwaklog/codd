@@ -441,6 +441,15 @@ mod tests {
 
         assert_eq!(result.is_some(), true);
 
+        assert_eq!(
+            result,
+            Some(vec![
+                vec![Value::Int(1), Value::Str("foo".to_string())],
+                vec![Value::Int(2), Value::Str("bar".to_string())],
+                vec![Value::Int(3), Value::Str("baz".to_string())],
+            ])
+        );
+
         println!("[TEST] query result: {:?}", result.unwrap());
 
         let select_value_attr = Operator::Unary(UnaryOpr::Projection(
