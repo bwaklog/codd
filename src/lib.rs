@@ -280,16 +280,22 @@ impl ProjAttrs {
                     .map(|row| row.clone())
                     .collect::<Vec<Row>>();
 
-                let mut relation = Relation {
+                let mut derived = Relation {
                     name: "derived".to_string(),
                     pk: relation.pk,
                     schema: relation.schema.clone(),
-                    data: Data::WithPK(Box::new(BTreeMap::new())),
+                    data: {
+                        if relation.pk.is_some() {
+                            Data::WithPK(Box::new(BTreeMap::new()))
+                        } else {
+                            Data::NoPK((0, Box::new(BTreeMap::new())))
+                        }
+                    },
                 };
 
-                relation.insert_rows(values);
+                derived.insert_rows(values);
 
-                return Some(relation);
+                return Some(derived);
             }
             _ => {}
         }
@@ -318,7 +324,10 @@ impl ProjAttrs {
 
         let mut pk_missing = false;
         if relation.pk.is_some() & !selected_attrs_indices.contains(&relation.pk.unwrap()) {
-            println!("[Projection] {:?} PK is not in the selected attributes", &relation.pk);
+            println!(
+                "[Projection] {:?} PK is not in the selected attributes",
+                &relation.pk
+            );
             pk_missing = true;
         }
 
@@ -619,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_pk_schema() {
+    fn test_remove_duplicates() {
         let mut relation = Relation {
             name: "pk_less".to_string(),
             pk: Some(0),
@@ -680,7 +689,29 @@ mod tests {
         right.sort();
         assert_eq!(left, right);
 
-        println!("[test] Project removed duplicate tuples")
+        println!("[test] Project removed duplicate tuples");
+
+        let derived = result.unwrap();
+        assert!(derived.pk.is_none());
+
+        let derived_query = Operator::Unary(UnaryOpr::Projection(ProjAttrs::None, &derived));
+        let derived_query_result = derived_query.evaluate();
+
+        assert!(derived_query_result.is_some());
+
+        let mut left = derived_query_result.as_ref().unwrap().data.tuples();
+        let mut right = vec![
+            vec![Value::Str("foo".to_string())],
+            vec![Value::Str("bar".to_string())],
+            vec![Value::Str("baz".to_string())],
+        ];
+
+        left.sort();
+        right.sort();
+        assert_eq!(left, right);
+        assert!(derived_query_result.unwrap().pk.is_none());
+
+        println!("[test] Project removed duplicate tuples");
     }
 
     #[test]
@@ -724,7 +755,6 @@ mod tests {
             ],
         ]);
         assert!(insert_result);
-        println!("{:?}", relation);
 
         // pi_{name, phone}
         let query = Operator::Unary(UnaryOpr::Projection(
@@ -747,11 +777,8 @@ mod tests {
         let result = query.evaluate();
 
         // tbl derived
-        // 0 | bob | 9999999999 <-
-        // 1 | alice | 6666666666
-        //^^^
-        // the new column here is a PK for
-        // the derived relation
+        // bob | 9999999999
+        // alice | 6666666666
         let mut left = result.as_ref().unwrap().data.tuples();
         let mut right = vec![
             vec![Value::Str("bob".to_string()), Value::Int(9999999999)],
@@ -761,7 +788,5 @@ mod tests {
         left.sort();
         right.sort();
         assert_eq!(left, right);
-
-        println!("{:?}", result.unwrap());
     }
 }
