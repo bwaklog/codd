@@ -53,14 +53,76 @@ impl Schema {
 }
 
 #[derive(Debug, Clone)]
+pub enum Data {
+    WithPK(Box<BTreeMap<Value, Row>>),
+    NoPK((i32, Box<BTreeMap<i32, Row>>)),
+}
+
+impl Data {
+    pub fn insert(&mut self, key: Option<Value>, row: Row) -> bool {
+        match self {
+            Data::WithPK(tree) => {
+                if key.is_none() {
+                    println!("[PANIC] key not provided while inserting BTree");
+                    return false;
+                }
+
+                _ = tree.insert(key.unwrap(), row);
+                return true;
+            }
+            Data::NoPK((key, tree)) => {
+                tree.insert(*key, row);
+                *key += 1;
+                return true;
+            }
+        }
+    }
+
+    pub fn contains(&self, key: Option<Value>, row: Option<Row>) -> bool {
+        match self {
+            Data::WithPK(tree) => {
+                if key.is_none() {
+                    println!("[DEBUG] {:?}", &self);
+                    println!("[PANIC] key not provided while querying BTree");
+                    return false;
+                }
+                tree.contains_key(&key.unwrap())
+            }
+            Data::NoPK((_, tree)) => {
+                if row.is_none() {
+                    println!("[DEBUG] {:?}", &self);
+                    println!("[PANIC] row not provided while querying BTree");
+                    return false;
+                }
+                tree.values().any(|v| v == row.as_ref().unwrap())
+            }
+        }
+    }
+
+    pub fn tuples(&self) -> Vec<Row> {
+        match self {
+            Data::WithPK(tree) => Vec::from_iter(tree.values())
+                .into_iter()
+                .map(|inner| inner.clone())
+                .collect(),
+            Data::NoPK((_, tree)) => Vec::from_iter(tree.values())
+                .into_iter()
+                .map(|inner| inner.clone())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 #[allow(unused)]
 pub struct Relation {
     name: String,
-    pk: usize,
+    pk: Option<usize>,
     // fks: Option<Vec<usize>>,
     schema: Schema,
 
-    data: BTreeMap<Value, Row>,
+    // data: BTreeMap<Value, Row>,
+    data: Data,
 }
 
 impl Relation {
@@ -69,11 +131,19 @@ impl Relation {
             return false;
         }
 
-        if self.data.contains_key(&row[self.pk]) {
+        if self.pk.is_none() {
+            // insert regardless
+            return self.data.insert(None, row);
+        }
+
+        if self
+            .data
+            .contains(Some(row[self.pk.unwrap()].clone()), None)
+        {
             return false;
         }
 
-        _ = self.data.insert(row[self.pk].clone(), row);
+        _ = self.data.insert(Some(row[self.pk.unwrap()].clone()), row);
 
         true
     }
@@ -84,10 +154,18 @@ impl Relation {
             return false;
         }
 
+        if self.pk.is_none() {
+            // insert all rows even if there are duplicates
+            for row in rows {
+                _ = self.data.insert(None, row);
+            }
+            return true;
+        }
+
         // rows if dup because of primary key repeations
         let nondup_rows = rows
             .iter()
-            .map(|r| r[self.pk].clone())
+            .map(|r| r[self.pk.unwrap()].clone())
             .collect::<std::collections::HashSet<Value>>()
             .len();
 
@@ -98,27 +176,30 @@ impl Relation {
             return false;
         }
 
-        let new_data = rows.iter().all(|r| !self.data.contains_key(&r[self.pk]));
+        let new_data = rows
+            .iter()
+            .all(|r| self.data.contains(Some(r[self.pk.unwrap()].clone()), None) == false);
         if !new_data {
-            println!("[ERROR] few keys in given rows already exist, not inserting - INSERT ROWS");
+            println!("[DEBUG] {:?}", &self);
+            println!("[ERROR] insert rows failed - INSERT ROWS");
             return false;
         }
 
         for row in rows {
-            _ = self.data.insert(row[self.pk].clone(), row);
+            _ = self.data.insert(Some(row[self.pk.unwrap()].clone()), row);
         }
 
         return true;
     }
 
     // this is being used in tests
-    #[allow(dead_code)]
-    fn get_tuples(&self) -> Vec<Row> {
-        Vec::from_iter(self.data.values())
-            .into_iter()
-            .map(|inner| inner.clone())
-            .collect::<Vec<Row>>()
-    }
+    // #[allow(dead_code)]
+    // fn get_tuples(&self) -> Vec<Row> {
+    //     Vec::from_iter(self.data.values())
+    //         .into_iter()
+    //         .map(|inner| inner.clone())
+    //         .collect::<Vec<Row>>()
+    // }
 }
 
 #[derive(Debug)]
@@ -190,16 +271,20 @@ impl ProjAttrs {
             ProjAttrs::None => {
                 // Same as SELECT * FROM relation
                 println!("[DEBUG][Projection] Query : Select *, returning all tuples");
-                let values = Vec::from_iter(relation.data.values())
+                let values = relation
+                    .data
+                    .tuples()
                     .into_iter()
-                    .map(|inner| inner.clone())
+                    .collect::<std::collections::HashSet<Row>>()
+                    .iter()
+                    .map(|row| row.clone())
                     .collect::<Vec<Row>>();
 
                 let mut relation = Relation {
                     name: "derived".to_string(),
                     pk: relation.pk,
                     schema: relation.schema.clone(),
-                    data: BTreeMap::new(),
+                    data: Data::WithPK(Box::new(BTreeMap::new())),
                 };
 
                 relation.insert_rows(values);
@@ -223,7 +308,7 @@ impl ProjAttrs {
             &self
         );
 
-        let mut rel_attributes = self.iter().map(|f| f.clone()).collect::<Vec<_>>();
+        let rel_attributes = self.iter().map(|f| f.clone()).collect::<Vec<_>>();
 
         let selected_attrs_indices = self
             .iter()
@@ -231,53 +316,56 @@ impl ProjAttrs {
             .map(|i| i.unwrap())
             .collect::<Vec<_>>();
 
-        let pk_missing = !selected_attrs_indices.contains(&relation.pk);
-        let mut pk_auto = 0;
+        let mut pk_missing = false;
+        if relation.pk.is_some() & !selected_attrs_indices.contains(&relation.pk.unwrap()) {
+            println!("[Projection] {:?} PK is not in the selected attributes", &relation.pk);
+            pk_missing = true;
+        }
 
-        // if pk_missing {
-        //     rel_attributes.insert(0, Attribute { name: "PKID".to_string(), atype: Type::Int});
-        // }
-
-        let values = Vec::from_iter(relation.data.values())
+        let values = relation
+            .data
+            .tuples()
             .into_iter()
             .map(|inner| {
-                let mut tuple = inner
+                inner
                     .clone()
                     .iter()
                     .enumerate()
                     .filter(|(index, _)| selected_attrs_indices.contains(index))
                     .map(|(_, v)| v.clone())
-                    .collect::<Vec<_>>();
-                if pk_missing {
-                    tuple.insert(0, Value::Int(pk_auto));
-                    pk_auto += 1;
-                }
-                return tuple;
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<Row>>();
+            .collect::<std::collections::HashSet<Row>>() // remove the duplicates
+            .iter()
+            .map(|v| v.clone())
+            .collect::<Vec<_>>();
 
         if pk_missing {
-            rel_attributes.insert(
-                0,
-                Attribute {
-                    name: "PKID".to_string(),
-                    atype: Type::Int,
+            let mut derived = Relation {
+                name: "derived".to_string(),
+                pk: None,
+                schema: Schema {
+                    attributes: rel_attributes,
                 },
-            );
+                data: Data::NoPK((0, Box::new(BTreeMap::new()))),
+            };
+
+            derived.insert_rows(values);
+            return Some(derived);
         }
 
-        let mut relation = Relation {
+        let mut derived = Relation {
             name: "derived".to_string(),
             pk: relation.pk,
             schema: Schema {
                 attributes: rel_attributes,
             },
-            data: BTreeMap::new(),
+            data: Data::WithPK(Box::new(BTreeMap::new())),
         };
 
-        relation.insert_rows(values);
+        derived.insert_rows(values);
 
-        return Some(relation);
+        return Some(derived);
     }
 }
 
@@ -391,10 +479,10 @@ mod tests {
 
         let relation = Relation {
             name: "test".to_string(),
-            pk: 0,
+            pk: Some(0),
             // fks: None,
             schema,
-            data: BTreeMap::new(),
+            data: Data::WithPK(Box::new(BTreeMap::new())),
         };
 
         relation
@@ -493,7 +581,7 @@ mod tests {
         assert_eq!(result.is_some(), true);
 
         assert_eq!(
-            result.as_ref().unwrap().get_tuples(),
+            result.as_ref().unwrap().data.tuples(),
             vec![
                 vec![Value::Int(1), Value::Str("foo".to_string())],
                 vec![Value::Int(2), Value::Str("bar".to_string())],
@@ -516,15 +604,83 @@ mod tests {
 
         let result = select_value_attr.evaluate();
         assert_eq!(result.is_some(), true);
+        let mut left = result.as_ref().unwrap().data.tuples();
+        let mut right = vec![
+            vec![Value::Str("foo".to_string())],
+            vec![Value::Str("bar".to_string())],
+            vec![Value::Str("baz".to_string())],
+        ];
+
+        left.sort();
+        right.sort();
+        assert_eq!(left, right);
+
+        println!("[TEST] selecting a single attribute {:?}", result);
+    }
+
+    #[test]
+    fn test_no_pk_schema() {
+        let mut relation = Relation {
+            name: "pk_less".to_string(),
+            pk: Some(0),
+            schema: Schema {
+                attributes: vec![
+                    Attribute {
+                        name: "id".to_string(),
+                        atype: Type::Int,
+                    },
+                    Attribute {
+                        name: "value".to_string(),
+                        atype: Type::Str,
+                    },
+                ],
+            },
+            data: Data::WithPK(Box::new(BTreeMap::new())),
+        };
+
+        let insert_result = relation.insert_rows(vec![
+            vec![Value::Int(1), Value::Str("foo".to_string())],
+            vec![Value::Int(2), Value::Str("bar".to_string())],
+            vec![Value::Int(3), Value::Str("baz".to_string())],
+            vec![Value::Int(4), Value::Str("foo".to_string())],
+        ]);
+
+        assert!(insert_result);
         assert_eq!(
-            result.as_ref().unwrap().get_tuples(),
+            relation.data.tuples(),
             vec![
-                vec![Value::Int(0), Value::Str("foo".to_string())],
-                vec![Value::Int(1), Value::Str("bar".to_string())],
-                vec![Value::Int(2), Value::Str("baz".to_string())]
+                vec![Value::Int(1), Value::Str("foo".to_string())],
+                vec![Value::Int(2), Value::Str("bar".to_string())],
+                vec![Value::Int(3), Value::Str("baz".to_string())],
+                vec![Value::Int(4), Value::Str("foo".to_string())],
             ]
         );
-        println!("[TEST] selecting a single attribute {:?}", result);
+
+        let query = Operator::Unary(UnaryOpr::Projection(
+            ProjAttrs::Attr(
+                Attribute {
+                    name: "value".to_string(),
+                    atype: Type::Str,
+                },
+                None,
+            ),
+            &relation,
+        ));
+        let result = query.evaluate();
+        assert!(result.is_some());
+
+        let mut left = result.as_ref().unwrap().data.tuples();
+        let mut right = vec![
+            vec![Value::Str("foo".to_string())],
+            vec![Value::Str("bar".to_string())],
+            vec![Value::Str("baz".to_string())],
+        ];
+
+        left.sort();
+        right.sort();
+        assert_eq!(left, right);
+
+        println!("[test] Project removed duplicate tuples")
     }
 
     #[test]
@@ -533,7 +689,7 @@ mod tests {
         // | id INT PK | name STR | phone INT
         let mut relation = Relation {
             name: "users".to_string(),
-            pk: 0,
+            pk: Some(0),
             schema: Schema {
                 attributes: vec![
                     Attribute {
@@ -550,7 +706,7 @@ mod tests {
                     },
                 ],
             },
-            data: BTreeMap::new(),
+            data: Data::WithPK(Box::new(BTreeMap::new())),
         };
 
         // 100 | bob | 9999999999
@@ -568,7 +724,7 @@ mod tests {
             ],
         ]);
         assert!(insert_result);
-        println!("{:?}", relation.data);
+        println!("{:?}", relation);
 
         // pi_{name, phone}
         let query = Operator::Unary(UnaryOpr::Projection(
@@ -596,21 +752,15 @@ mod tests {
         //^^^
         // the new column here is a PK for
         // the derived relation
-        assert_eq!(
-            result.as_ref().unwrap().get_tuples(),
-            vec![
-                vec![
-                    Value::Int(0),
-                    Value::Str("bob".to_string()),
-                    Value::Int(9999999999)
-                ],
-                vec![
-                    Value::Int(1),
-                    Value::Str("alice".to_string()),
-                    Value::Int(6666666666)
-                ],
-            ]
-        );
+        let mut left = result.as_ref().unwrap().data.tuples();
+        let mut right = vec![
+            vec![Value::Str("bob".to_string()), Value::Int(9999999999)],
+            vec![Value::Str("alice".to_string()), Value::Int(6666666666)],
+        ];
+
+        left.sort();
+        right.sort();
+        assert_eq!(left, right);
 
         println!("{:?}", result.unwrap());
     }
